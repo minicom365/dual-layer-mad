@@ -1,11 +1,152 @@
 # [EN] DualLayerMAD: Robust Noise Baseline Estimation Immune to Step-Edges and Outliers
 # [KO] DualLayerMAD: 스텝 에지 및 이상치에 강건한 노이즈 배경 수준 측정 알고리즘
+# [Arch] Implements 1D Dual-Layer MAD with non-zero MAD1 fallback and 4-step conditional truncated-normal fixed-point compensation (excluding static 1.4826/1.6558 scales and pre-MAD folded differences).
 # Author: minicom365
 # License: MIT
 
 import math
-from typing import List, Union, Sequence, Optional
+from typing import List, Union, Sequence
 import numpy as np
+
+_SQRT2 = 1.4142135623730951
+_INV_SQRT2PI = 0.3989422804014327
+
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / _SQRT2))
+
+
+def _norm_pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) * _INV_SQRT2PI
+
+
+def _norm_ppf(p: float) -> float:
+    z = 0.0
+    for _ in range(6):
+        err = _norm_cdf(z) - p
+        pdf = _norm_pdf(z)
+        z -= err / (pdf + 0.5 * z * err)
+    return z
+
+
+_Z75 = _norm_ppf(0.75)
+_C_GAUSS = 1.0 / _Z75
+_C0_TAU25 = 2.5 * _Z75
+_Q0_TAU25 = _norm_ppf(0.25 + 0.5 * _norm_cdf(_C0_TAU25))
+
+
+def _median_sorted(s: List[float]) -> float:
+    m = len(s)
+    mid = m >> 1
+    if m & 1:
+        return s[mid]
+    return 0.5 * (s[mid - 1] + s[mid])
+
+
+def _truncated_mad_fixed_point(mad2: float, r1: float) -> float:
+    sig = mad2 / _Q0_TAU25
+    r1_floor = 1e-12 * r1
+    for _ in range(4):
+        c_eff = max(_C0_TAU25, r1 / max(sig, r1_floor))
+        sig = mad2 / _norm_ppf(0.25 + 0.5 * _norm_cdf(c_eff))
+    return sig
+
+
+def _dual_mad_std_from_list(sample_set: List[float]) -> float:
+    n = len(sample_set)
+    if n < 2:
+        return 0.0
+
+    sorted_history = sorted(sample_set)
+    rng = sorted_history[-1] - sorted_history[0]
+    if rng <= 0.0:
+        return 0.0
+
+    tol = 1e-12 * rng
+    min_nz = 2 if n < 16 else max(3, n // 20)
+    med = _median_sorted(sorted_history)
+    abs_devs = [abs(x - med) for x in sample_set]
+    sorted_abs_devs = sorted(abs_devs)
+    mad1 = _median_sorted(sorted_abs_devs)
+
+    if mad1 <= tol:
+        nz_devs = [d for d in sorted_abs_devs if d > tol]
+        if len(nz_devs) < min_nz:
+            return 0.0
+        eff_mad1 = _median_sorted(nz_devs)
+        r1 = 2.5 * eff_mad1
+        nz_inliers = [d for d in nz_devs if d <= r1]
+        if len(nz_inliers) < 2:
+            return eff_mad1 * _C_GAUSS
+        return _truncated_mad_fixed_point(_median_sorted(nz_inliers), r1)
+
+    # Level 1: Step-edge & outlier rejection threshold
+    r1 = 2.5 * mad1
+    candidates = [
+        x for x, dev in zip(sample_set, abs_devs) if dev <= r1
+    ]
+
+    c_len = len(candidates)
+    if c_len < 2:
+        return mad1 * _C_GAUSS
+
+    # Level 2: Pure noise deviation estimation on filtered inliers
+    sorted_candidates = sorted(candidates)
+    pure_med = _median_sorted(sorted_candidates)
+
+    pure_abs_devs = sorted(abs(x - pure_med) for x in candidates)
+    pure_mad = _median_sorted(pure_abs_devs)
+    if pure_mad <= tol:
+        nz_pure = [d for d in pure_abs_devs if d > tol]
+        if len(nz_pure) < min_nz:
+            return 0.0
+        pure_mad = _median_sorted(nz_pure)
+
+    return _truncated_mad_fixed_point(pure_mad, r1)
+
+
+def _dual_mad_std_from_array(window: np.ndarray) -> float:
+    n = window.size
+    if n < 2:
+        return 0.0
+
+    rng = float(np.max(window) - np.min(window))
+    if rng <= 0.0:
+        return 0.0
+
+    tol = 1e-12 * rng
+    min_nz = 2 if n < 16 else max(3, n // 20)
+    med = float(np.median(window))
+    abs_devs = np.abs(window - med)
+    mad1 = float(np.median(abs_devs))
+
+    if mad1 <= tol:
+        nz_devs = abs_devs[abs_devs > tol]
+        if nz_devs.size < min_nz:
+            return 0.0
+        eff_mad1 = float(np.median(nz_devs))
+        r1 = 2.5 * eff_mad1
+        nz_inliers = nz_devs[nz_devs <= r1]
+        if nz_inliers.size < 2:
+            return eff_mad1 * _C_GAUSS
+        return _truncated_mad_fixed_point(float(np.median(nz_inliers)), r1)
+
+    r1 = 2.5 * mad1
+    candidates = window[abs_devs <= r1]
+    if candidates.size < 2:
+        return mad1 * _C_GAUSS
+
+    pure_med = float(np.median(candidates))
+    pure_devs = np.abs(candidates - pure_med)
+    pure_mad = float(np.median(pure_devs))
+    if pure_mad <= tol:
+        nz_pure = pure_devs[pure_devs > tol]
+        if nz_pure.size < min_nz:
+            return 0.0
+        pure_mad = float(np.median(nz_pure))
+
+    return _truncated_mad_fixed_point(pure_mad, r1)
+
 
 class DualLayerMAD:
     """
@@ -39,7 +180,7 @@ class DualLayerMAD:
     def get_std(self) -> float:
         """
         [EN] Estimate robust standard deviation (sigma) of the noise background.
-        [KO] 노이즈 배경의 강건한 표준편차(sigma = 1.4826 * pure_mad) 추정.
+        [KO] 노이즈 배경의 강건한 절단 정규분포 보정 표준편차(sigma) 추정.
         """
         if not self.history:
             return 0.0
@@ -54,36 +195,7 @@ class DualLayerMAD:
         else:
             sample_set = self.history
 
-        n = len(sample_set)
-        if n < 2:
-            return 0.0
-
-        sorted_history = sorted(sample_set)
-        med = sorted_history[n // 2]
-        abs_devs = [abs(x - med) for x in sample_set]
-        sorted_abs_devs = sorted(abs_devs)
-        mad1 = sorted_abs_devs[n // 2]
-        if mad1 == 0:
-            return 0.0
-
-        # Level 1: Step-edge & outlier rejection threshold
-        threshold = 2.5 * mad1
-        candidates = [
-            x for x, dev in zip(sample_set, abs_devs) if dev <= threshold
-        ]
-
-        c_len = len(candidates)
-        if c_len < 2:
-            return mad1 * 1.4826
-
-        # Level 2: Pure noise deviation estimation on filtered inliers
-        sorted_candidates = sorted(candidates)
-        pure_med = sorted_candidates[c_len // 2]
-
-        pure_abs_devs = sorted([abs(x - pure_med) for x in candidates])
-        pure_mad = pure_abs_devs[c_len // 2]
-
-        return pure_mad * 1.4826
+        return _dual_mad_std_from_list(sample_set)
 
     def get_variance(self) -> float:
         """
@@ -93,6 +205,7 @@ class DualLayerMAD:
         s = self.get_std()
         return s * s
 
+
 def get_dual_mad_noise(
     signal: Union[np.ndarray, Sequence[float]],
     window_size: int = 50,
@@ -100,10 +213,10 @@ def get_dual_mad_noise(
 ) -> np.ndarray:
     """
     [EN] Batch Dual-Layer MAD noise curve estimator for 1D signals (Step-Edge Immune).
-    Processes signal differences in optimized chunks to achieve high throughput.
+    Processes signed 1st-order differences in optimized chunks with sqrt(2) norm and truncation compensation.
 
     [KO] 1D 신호를 위한 배치 2중 MAD 노이즈 곡선 추정기 (스텝 에지 면역).
-    신호의 1차 차분에 대해 2단계 MAD 필터링을 수행하여 이상치와 데이터 꺾임에 강건한 노이즈 레벨을 도출합니다.
+    부호 있는 1차 차분에 대해 2단계 MAD 필터링과 sqrt(2) 정규화 및 절단 정규분포 고정점 보정을 수행합니다.
     """
     arr = np.asarray(signal, dtype=np.float64)
     n = len(arr)
@@ -112,7 +225,7 @@ def get_dual_mad_noise(
     if n == 1:
         return np.zeros(1, dtype=np.float64)
 
-    diff = np.abs(np.diff(arr, prepend=arr[0]))
+    diff = np.diff(arr, prepend=arr[0])
     noise_curve = np.zeros(n, dtype=np.float64)
 
     for i in range(0, n, chunk_size):
@@ -120,21 +233,9 @@ def get_dual_mad_noise(
         end = min(n, i + chunk_size)
         window = diff[start:end]
 
-        if len(window) < 2:
+        if window.size < 2:
             continue
 
-        # Level 1: Step-edge removal (reject points far from median)
-        med = np.median(window)
-        mad = np.median(np.abs(window - med))
-        mask = np.abs(window - med) < (2.5 * mad + 1e-9)
-        candidates = window[mask]
-
-        # Level 2: Estimate pure noise on surviving inlier residuals
-        if len(candidates) > 2:
-            pure_mad = np.median(np.abs(candidates - np.median(candidates)))
-            val = pure_mad * 1.4826
-            noise_curve[i:i + chunk_size] = val
-        else:
-            noise_curve[i:i + chunk_size] = mad * 1.4826
+        noise_curve[i:i + chunk_size] = _dual_mad_std_from_array(window) / _SQRT2
 
     return noise_curve
