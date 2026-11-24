@@ -114,10 +114,56 @@ def test_batch_dual_mad_noise():
     assert np.all(noise_curve < 3.0), f"Noise curve exceeded bound: max {np.max(noise_curve)}"
     assert np.mean(noise_curve) > 0.1
 
+
+def test_zero_inflation_sweep_quantization_and_breakdown():
+    """Verify p0=0.00..0.60 zero-inflation continuity (odd/even N), uint8 safety, and p0=0.40+31% outlier breakdown."""
+    rng = np.random.default_rng(20261124)
+    sigma = 2.0
+    for n in [1000, 1001]:
+        for p0 in [0.00, 0.10, 0.25, 0.30, 0.34, 0.40, 0.48, 0.50, 0.55, 0.60]:
+            k0 = int(round(p0 * n))
+            vals_list, vals_arr = [], []
+            for _ in range(20):
+                x = rng.normal(0.0, sigma, size=n)
+                if k0 > 0:
+                    x[rng.choice(n, size=k0, replace=False)] = 0.0
+                est = DualLayerMAD(window_size=n)
+                est.history = x.tolist()
+                vals_list.append(est.get_std())
+                # Batch 1st-diff on cumulative walk of zero-inflated increments
+                walk = np.cumsum(x) * math.sqrt(2.0)
+                curve = get_dual_mad_noise(walk, window_size=n, chunk_size=n)
+                vals_arr.append(float(curve[-1]))
+
+            m_list = float(np.mean(vals_list))
+            m_arr = float(np.mean(vals_arr))
+            assert 0.90 * sigma <= m_list <= 1.12 * sigma, f"List N={n}, p0={p0}: got {m_list}"
+            assert 0.90 * sigma <= m_arr <= 1.12 * sigma, f"Array N={n}, p0={p0}: got {m_arr}"
+
+    # uint8 quantized Gaussian (sigma=2.0, 5.0) without zero-inflation must not jump
+    for true_sig, lo, hi in [(2.0, 1.50, 2.30), (5.0, 4.70, 5.30)]:
+        q = np.clip(np.round(128.0 + rng.normal(0.0, true_sig, size=1000)), 0.0, 255.0)
+        est_q = DualLayerMAD(window_size=1000)
+        est_q.history = q.tolist()
+        s_q = est_q.get_std()
+        assert lo <= s_q <= hi, f"uint8 sigma={true_sig} jumped to {s_q}"
+
+    # p0=0.40 exact zeros + 31% gross outliers (+1000) preserves 50% breakdown
+    bd_vals = []
+    for _ in range(20):
+        x_bd = np.concatenate([np.zeros(400), rng.normal(0.0, 1.0, size=290), np.full(310, 1000.0)])
+        rng.shuffle(x_bd)
+        est_bd = DualLayerMAD(window_size=1000)
+        est_bd.history = x_bd.tolist()
+        bd_vals.append(est_bd.get_std())
+    assert 0.85 <= float(np.mean(bd_vals)) <= 1.20, f"Breakdown failed: {np.mean(bd_vals)}"
+
+
 if __name__ == "__main__":
     test_gaussian_noise_estimation()
     test_unbiased_gaussian_large_sample_and_outliers()
     test_quantized_sparse_mad1_zero_fallback()
     test_step_edge_immunity()
     test_batch_dual_mad_noise()
+    test_zero_inflation_sweep_quantization_and_breakdown()
     print("[+] All DualLayerMAD unit tests passed successfully!")
