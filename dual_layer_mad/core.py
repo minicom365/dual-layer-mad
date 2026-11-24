@@ -60,11 +60,13 @@ def _excess_point_mass_list(sorted_devs: List[float], tol: float) -> Tuple[int, 
     first_gt = bisect.bisect_right(sorted_devs, tol)
     if first_gt < 2 or first_gt >= n:
         return first_gt, 0.0
-    d_min = sorted_devs[first_gt]
-    n1 = bisect.bisect_right(sorted_devs, 1.5 * d_min, first_gt, n) - first_gt
-    if first_gt <= n1:
+    nz_cnt = n - first_gt
+    ref_off = min(nz_cnt - 1, min(3, nz_cnt // 150))
+    d_ref = sorted_devs[first_gt + ref_off]
+    n1 = bisect.bisect_right(sorted_devs, 1.5 * d_ref, first_gt, n) - first_gt
+    if 2 * n1 >= first_gt:
         return first_gt, 0.0
-    return first_gt, float(first_gt - n1) / float(n)
+    return first_gt, float(first_gt) / float(n)
 
 
 def _excess_point_mass_array(sorted_devs: np.ndarray, tol: float) -> Tuple[int, float]:
@@ -72,11 +74,13 @@ def _excess_point_mass_array(sorted_devs: np.ndarray, tol: float) -> Tuple[int, 
     first_gt = int(np.searchsorted(sorted_devs, tol, side="right"))
     if first_gt < 2 or first_gt >= n:
         return first_gt, 0.0
-    d_min = float(sorted_devs[first_gt])
-    n1 = int(np.searchsorted(sorted_devs, 1.5 * d_min, side="right")) - first_gt
-    if first_gt <= n1:
+    nz_cnt = n - first_gt
+    ref_off = min(nz_cnt - 1, min(3, nz_cnt // 150))
+    d_ref = float(sorted_devs[first_gt + ref_off])
+    n1 = int(np.searchsorted(sorted_devs, 1.5 * d_ref, side="right")) - first_gt
+    if 2 * n1 >= first_gt:
         return first_gt, 0.0
-    return first_gt, float(first_gt - n1) / float(n)
+    return first_gt, float(first_gt) / float(n)
 
 
 def _debias_mad1_point_mass(mad1: float, p0_hat: float) -> float:
